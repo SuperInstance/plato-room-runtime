@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: plato-room-runtime
+Version: 0.1.0
+Summary: Room execution engine — enter, leave, navigate, manage PLATO rooms
+License: MIT
+Requires-Python: >=3.8
