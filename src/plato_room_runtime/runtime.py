@@ -1,148 +1,212 @@
-"""PLATO room management runtime."""
-
-from __future__ import annotations
-
+"""Room runtime — lifecycle management, middleware pipeline, hooks, and event processing."""
 import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Callable, Any
+from collections import defaultdict, deque
+from enum import Enum
 
+class RoomPhase(Enum):
+    CREATED = "created"
+    INITIALIZING = "initializing"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    DRAINING = "draining"
+    SHUTTING_DOWN = "shutting_down"
+    TERMINATED = "terminated"
+
+class EventType(Enum):
+    TILE_CREATED = "tile_created"
+    TILE_UPDATED = "tile_updated"
+    TILE_DELETED = "tile_deleted"
+    AGENT_JOINED = "agent_joined"
+    AGENT_LEFT = "agent_left"
+    ROOM_PHASE_CHANGE = "room_phase_change"
+    ROOM_ERROR = "room_error"
+    HEARTBEAT = "heartbeat"
 
 @dataclass
-class Room:
-    """A PLATO room."""
+class RoomEvent:
+    event_type: EventType
+    room_id: str = ""
+    agent_id: str = ""
+    data: dict = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    source: str = ""
+    metadata: dict = field(default_factory=dict)
 
-    name: str
-    tiles: list[dict] = field(default_factory=list)
-    agents: list[str] = field(default_factory=list)
-    temperature: str = "cold"
-    created_at: float = field(default_factory=time.time)
+@dataclass
+class MiddlewareResult:
+    pass_through: bool = True
+    transformed_event: Optional[RoomEvent] = None
+    response: Any = None
+    error: str = ""
 
+class Middleware:
+    def __init__(self, name: str, handler: Callable, order: int = 0):
+        self.name = name
+        self.handler = handler
+        self.order = order
+        self.enabled = True
+        self.processed_count = 0
+        self.error_count = 0
+        self.avg_latency_ms: float = 0.0
+
+@dataclass
+class RoomConfig:
+    room_id: str
+    max_tiles: int = 10000
+    max_agents: int = 100
+    heartbeat_interval: float = 30.0
+    event_buffer_size: int = 1000
+    auto_pause_on_error: bool = True
+    error_threshold: int = 10
+    metadata: dict = field(default_factory=dict)
 
 class RoomRuntime:
-    """Runtime for managing PLATO rooms."""
+    def __init__(self, config: RoomConfig):
+        self.config = config
+        self.phase = RoomPhase.CREATED
+        self.agents: set[str] = set()
+        self.tile_count: int = 0
+        self._middleware: list[Middleware] = []
+        self._hooks: dict[str, list[Callable]] = defaultdict(list)
+        self._event_buffer: deque = deque(maxlen=config.event_buffer_size)
+        self._error_count: int = 0
+        self._event_count: int = 0
+        self._start_time: float = 0.0
+        self._uptime: float = 0.0
+        self._metrics: dict = defaultdict(int)
+        self._metrics["events_by_type"] = defaultdict(int)
 
-    def __init__(self) -> None:
-        self._rooms: dict[str, Room] = {}
+    def add_middleware(self, name: str, handler: Callable, order: int = 0) -> Middleware:
+        mw = Middleware(name=name, handler=handler, order=order)
+        self._middleware.append(mw)
+        self._middleware.sort(key=lambda m: m.order)
+        return mw
 
-    def create_room(self, name: str, temperature: str = "cold") -> Room:
-        """Create a new room."""
-        if name in self._rooms:
-            raise ValueError(f"Room '{name}' already exists.")
-        room = Room(name=name, temperature=temperature)
-        self._rooms[name] = room
-        return room
+    def remove_middleware(self, name: str) -> bool:
+        for i, mw in enumerate(self._middleware):
+            if mw.name == name:
+                self._middleware.pop(i)
+                return True
+        return False
 
-    def enter(self, room_name: str, agent_id: str) -> Room:
-        """Add an agent to a room and warm the room."""
-        room = self._get_room_or_raise(room_name)
-        if agent_id not in room.agents:
-            room.agents.append(agent_id)
-        room.temperature = self._compute_temp(len(room.tiles))
-        return room
+    def on(self, event_type: str, handler: Callable):
+        self._hooks[event_type].append(handler)
 
-    def leave(self, room_name: str, agent_id: str) -> Room:
-        """Remove an agent from a room; cool to 'cold' if empty."""
-        room = self._get_room_or_raise(room_name)
-        if agent_id in room.agents:
-            room.agents.remove(agent_id)
-        if not room.agents:
-            room.temperature = "cold"
-        return room
+    def off(self, event_type: str, handler: Callable = None):
+        if handler:
+            self._hooks[event_type] = [h for h in self._hooks[event_type] if h != handler]
+        else:
+            self._hooks[event_type].clear()
 
-    def add_tile(self, room_name: str, tile_dict: dict) -> Room:
-        """Add a tile to a room and warm the room."""
-        room = self._get_room_or_raise(room_name)
-        room.tiles.append(tile_dict)
-        room.temperature = self._compute_temp(len(room.tiles))
-        return room
+    def emit(self, event: RoomEvent) -> list[MiddlewareResult]:
+        event.room_id = event.room_id or self.config.room_id
+        self._event_buffer.append(event)
+        self._event_count += 1
+        self._metrics["events_by_type"][event.event_type.value] += 1
 
-    def remove_tile(self, room_name: str, tile_index: int) -> Room:
-        """Remove a tile from a room by index."""
-        room = self._get_room_or_raise(room_name)
-        if tile_index < 0 or tile_index >= len(room.tiles):
-            raise IndexError(f"Tile index {tile_index} out of range.")
-        room.tiles.pop(tile_index)
-        room.temperature = self._compute_temp(len(room.tiles))
-        return room
+        results = []
+        current_event = event
+        for mw in self._middleware:
+            if not mw.enabled:
+                continue
+            start = time.time()
+            try:
+                result = mw.handler(current_event, self)
+                mw.processed_count += 1
+                elapsed = (time.time() - start) * 1000
+                mw.avg_latency_ms = (mw.avg_latency_ms * (mw.processed_count - 1) + elapsed) / mw.processed_count
+                if isinstance(result, MiddlewareResult):
+                    results.append(result)
+                    if not result.pass_through:
+                        return results
+                    if result.transformed_event:
+                        current_event = result.transformed_event
+            except Exception as e:
+                mw.error_count += 1
+                self._error_count += 1
+                results.append(MiddlewareResult(pass_through=True, error=str(e)))
 
-    def get_room(self, name: str) -> Optional[Room]:
-        """Get a room by name, or None if it does not exist."""
-        return self._rooms.get(name)
+        # Fire hooks
+        for handler in self._hooks.get(event.event_type.value, []):
+            try: handler(current_event)
+            except: pass
 
-    def list_rooms(self) -> list[Room]:
-        """List all rooms."""
-        return list(self._rooms.values())
+        # Auto-pause check
+        if self.config.auto_pause_on_error and self._error_count >= self.config.error_threshold:
+            if self.phase == RoomPhase.ACTIVE:
+                self.set_phase(RoomPhase.PAUSED)
 
-    def search_rooms(self, query: str, top_n: int = 5) -> list[Room]:
-        """Search rooms by keyword overlap across room tiles."""
-        query_words = set(query.lower().split())
-        if not query_words:
-            return []
+        return results
 
-        scored: list[tuple[int, Room]] = []
-        for room in self._rooms.values():
-            score = 0
-            for tile in room.tiles:
-                for value in tile.values():
-                    if isinstance(value, str):
-                        tile_words = set(value.lower().split())
-                        score += len(query_words & tile_words)
-            if score > 0:
-                scored.append((score, room))
+    def set_phase(self, phase: RoomPhase):
+        old = self.phase
+        self.phase = phase
+        if phase == RoomPhase.ACTIVE and old != RoomPhase.ACTIVE:
+            self._start_time = time.time()
+        if phase != RoomPhase.ACTIVE and old == RoomPhase.ACTIVE:
+            self._uptime += time.time() - self._start_time
+        self.emit(RoomEvent(event_type=EventType.ROOM_PHASE_CHANGE,
+                           data={"old_phase": old.value, "new_phase": phase.value}))
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [room for _, room in scored[:top_n]]
+    def join(self, agent_id: str) -> bool:
+        if len(self.agents) >= self.config.max_agents:
+            return False
+        self.agents.add(agent_id)
+        self.emit(RoomEvent(event_type=EventType.AGENT_JOINED, agent_id=agent_id))
+        return True
 
-    def navigate(self, room_name: str, agent_id: str) -> dict:
-        """Return navigation info for a room."""
-        room = self._get_room_or_raise(room_name)
-        return {
-            "room": room,
-            "tiles_count": len(room.tiles),
-            "agents": room.agents,
-            "temperature": room.temperature,
-        }
+    def leave(self, agent_id: str) -> bool:
+        if agent_id not in self.agents:
+            return False
+        self.agents.discard(agent_id)
+        self.emit(RoomEvent(event_type=EventType.AGENT_LEFT, agent_id=agent_id))
+        return True
 
-    def room_temp(self, room_name: str) -> str:
-        """Compute temperature classification based on tile count."""
-        room = self._get_room_or_raise(room_name)
-        return self._compute_temp(len(room.tiles))
+    def start(self):
+        self.set_phase(RoomPhase.INITIALIZING)
+        self.set_phase(RoomPhase.ACTIVE)
 
+    def pause(self):
+        self.set_phase(RoomPhase.PAUSED)
+
+    def resume(self):
+        if self.phase == RoomPhase.PAUSED:
+            self.set_phase(RoomPhase.ACTIVE)
+
+    def shutdown(self):
+        self.set_phase(RoomPhase.DRAINING)
+        self.set_phase(RoomPhase.SHUTTING_DOWN)
+        self.agents.clear()
+        self.set_phase(RoomPhase.TERMINATED)
+
+    def heartbeat(self):
+        self.emit(RoomEvent(event_type=EventType.HEARTBEAT))
+
+    def recent_events(self, limit: int = 50) -> list[RoomEvent]:
+        return list(self._event_buffer)[-limit:]
+
+    def events_by_type(self, event_type: EventType, limit: int = 50) -> list[RoomEvent]:
+        return [e for e in self._event_buffer if e.event_type == event_type][-limit:]
+
+    @property
+    def uptime_seconds(self) -> float:
+        base = self._uptime
+        if self.phase == RoomPhase.ACTIVE:
+            base += time.time() - self._start_time
+        return base
+
+    @property
     def stats(self) -> dict:
-        """Return aggregate statistics across all rooms."""
-        total_rooms = len(self._rooms)
-        total_tiles = sum(len(r.tiles) for r in self._rooms.values())
-        total_agents = sum(len(r.agents) for r in self._rooms.values())
-        distribution: dict[str, int] = {
-            "cold": 0,
-            "warm": 0,
-            "hot": 0,
-            "crystallized": 0,
-        }
-        for room in self._rooms.values():
-            temp = self._compute_temp(len(room.tiles))
-            distribution[temp] = distribution.get(temp, 0) + 1
         return {
-            "total_rooms": total_rooms,
-            "total_tiles": total_tiles,
-            "total_agents": total_agents,
-            "temp_distribution": distribution,
+            "room_id": self.config.room_id, "phase": self.phase.value,
+            "agents": len(self.agents), "tiles": self.tile_count,
+            "events": self._event_count, "errors": self._error_count,
+            "middleware": len(self._middleware), "hooks": sum(len(h) for h in self._hooks.values()),
+            "uptime_s": round(self.uptime_seconds, 1),
+            "buffer_usage": len(self._event_buffer) / self.config.event_buffer_size,
+            "events_by_type": dict(self._metrics["events_by_type"]),
         }
-
-    def _get_room_or_raise(self, room_name: str) -> Room:
-        """Internal helper to fetch a room or raise an error."""
-        room = self._rooms.get(room_name)
-        if room is None:
-            raise KeyError(f"Room '{room_name}' does not exist.")
-        return room
-
-    @staticmethod
-    def _compute_temp(tile_count: int) -> str:
-        """Compute temperature based on tile count."""
-        if tile_count < 50:
-            return "cold"
-        if tile_count < 500:
-            return "warm"
-        if tile_count < 1000:
-            return "hot"
-        return "crystallized"
